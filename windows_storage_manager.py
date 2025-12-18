@@ -10,7 +10,7 @@ import subprocess
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Set
 import platform
 
 # ANSI color codes
@@ -46,6 +46,68 @@ def print_error(text: str):
 def print_info(text: str):
     """Print info message"""
     print(f"{Colors.CYAN}ℹ {text}{Colors.ENDC}")
+
+def _ps_escape_double_quotes(value: str) -> str:
+    return value.replace('`', '``').replace('"', '`"')
+
+def _parse_wsl_quiet_list(output: str) -> List[str]:
+    distros: List[str] = []
+    for raw in output.splitlines():
+        cleaned = raw.replace('\x00', '').strip().lstrip('\ufeff')
+        if cleaned:
+            distros.append(cleaned)
+
+    # De-duplicate while preserving order
+    seen = set()
+    unique: List[str] = []
+    for d in distros:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+    return unique
+
+def _is_wsl_manage_unsupported(output: str) -> bool:
+    output_lower = (output or "").lower()
+    return (
+        "unknown option" in output_lower
+        or "unrecognized option" in output_lower
+        or "parameter is incorrect" in output_lower
+        or "invalid command line option" in output_lower
+    )
+
+def _try_get_wsl_vhdx_path_from_registry(distro: str) -> Optional[str]:
+    distro_arg = _ps_escape_double_quotes(distro)
+    ps_script = f"""
+$ErrorActionPreference = 'SilentlyContinue'
+$name = \"{distro_arg}\"
+$key = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss'
+$item = Get-ChildItem -Path $key | ForEach-Object {{ Get-ItemProperty $_.PSPath }} | Where-Object {{ $_.DistributionName -eq $name }} | Select-Object -First 1
+if ($null -eq $item) {{ exit 2 }}
+$base = $item.BasePath
+if ([string]::IsNullOrWhiteSpace($base)) {{ exit 3 }}
+$vhdx = Join-Path -Path $base -ChildPath 'ext4.vhdx'
+Write-Output $vhdx
+"""
+    code, output = run_powershell(ps_script, capture=True)
+
+    if code != 0:
+        return None
+
+    path = (output or "").strip().splitlines()[-1].strip() if (output or "").strip() else ""
+    if not path:
+        return None
+    if not os.path.exists(path):
+        return None
+    return path
+
+def _try_get_docker_desktop_vhdx_path() -> Optional[str]:
+    localappdata = os.environ.get('LOCALAPPDATA', '')
+    if not localappdata:
+        return None
+    candidate = os.path.join(localappdata, 'Docker', 'wsl', 'data', 'ext4.vhdx')
+    if os.path.exists(candidate):
+        return candidate
+    return None
 
 def run_powershell(command: str, capture: bool = True, check: bool = False) -> Tuple[int, str]:
     """
@@ -201,12 +263,13 @@ class WindowsStorageManager:
         code, output = run_powershell("wsl --list --quiet", capture=True)
 
         if code == 0:
-            distros = [d.strip() for d in output.strip().split('\n') if d.strip()]
+            distros = _parse_wsl_quiet_list(output)
             for distro in distros:
                 if distro:
                     # Try to get disk usage from within the distro
                     print(f"\n{Colors.CYAN}{distro}:{Colors.ENDC}")
-                    code, usage = run_powershell(f"wsl -d {distro} df -h /", capture=True)
+                    distro_arg = _ps_escape_double_quotes(distro)
+                    code, usage = run_powershell(f"wsl -d \"{distro_arg}\" df -h /", capture=True)
                     if code == 0:
                         print(usage)
                     else:
@@ -322,7 +385,7 @@ class WindowsStorageManager:
             print_error("Failed to get WSL distributions")
             return
 
-        distros = [d.strip() for d in output.strip().split('\n') if d.strip()]
+        distros = _parse_wsl_quiet_list(output)
 
         if not distros:
             print_warning("No WSL distributions found")
@@ -373,19 +436,26 @@ class WindowsStorageManager:
         for distro in distributions_to_compact:
             print(f"{Colors.CYAN}Compacting: {distro}{Colors.ENDC}")
 
+            distro_arg = _ps_escape_double_quotes(distro)
+
             code, output = run_powershell(
-                f"wsl --manage {distro} --set-sparse true",
+                f"wsl --manage \"{distro_arg}\" --set-sparse true",
                 capture=True
             )
 
             if code == 0:
                 print_success(f"Successfully compacted {distro}")
             else:
-                if "parameter is incorrect" in output.lower():
+                output_str = (output or "").strip()
+                output_lower = output_str.lower()
+                if "parameter is incorrect" in output_lower or "unknown option" in output_lower:
                     print_warning(f"Modern method not supported for {distro}")
                     print_info("Try using Diskpart method (Option 5) instead")
                 else:
-                    print_error(f"Failed to compact {distro}: {output}")
+                    if output_str:
+                        print_error(f"Failed to compact {distro}: {output_str}")
+                    else:
+                        print_error(f"Failed to compact {distro} (exit code {code})")
 
         print_success("\nCompaction process completed!")
         print_info("Check your disk space to verify space was reclaimed")
@@ -448,51 +518,72 @@ class WindowsStorageManager:
 
         for vhdx in files_to_compact:
             path = vhdx['path']
+
             print(f"{Colors.CYAN}Compacting: {vhdx['name']}{Colors.ENDC}")
             print(f"Path: {path}")
             print(f"Size before: {format_size(vhdx['size'])}")
+            print_info("Running diskpart (this may take several minutes)...")
 
-            # Create diskpart script
-            diskpart_script = f"""select vdisk file="{path}"
+            ok, err = self._compact_vhdx_diskpart(path)
+            if ok:
+                try:
+                    new_size = os.path.getsize(path)
+                    old_size = vhdx['size']
+                    saved = old_size - new_size
+
+                    print_success("Compaction completed!")
+                    print(f"Size after: {format_size(new_size)}")
+                    print(f"Space saved: {format_size(saved)}")
+                except:
+                    print_success("Compaction completed!")
+            else:
+                if err:
+                    print_error(f"Diskpart failed: {err}")
+                else:
+                    print_error("Diskpart failed")
+
+            print()
+
+    def _is_optimize_vhd_available(self) -> bool:
+        code, output = run_powershell(
+            "Get-Command Optimize-VHD -ErrorAction SilentlyContinue | Select-Object -First 1",
+            capture=True,
+        )
+        return code == 0 and bool((output or "").strip())
+
+    def _compact_vhdx_optimize_vhd(self, path: str) -> Tuple[bool, str]:
+        code, output = run_powershell(
+            f'Optimize-VHD -Path "{path}" -Mode Full',
+            capture=True,
+        )
+        if code == 0:
+            return True, ""
+        return False, (output or "").strip()
+
+    def _compact_vhdx_diskpart(self, path: str) -> Tuple[bool, str]:
+        diskpart_script = f"""select vdisk file=\"{path}\"
+attach vdisk readonly
 compact vdisk
 detach vdisk
 exit
 """
-
-            # Run diskpart
-            print_info("Running diskpart (this may take several minutes)...")
-
-            try:
-                process = subprocess.Popen(
-                    ['diskpart'],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True
-                )
-                stdout, stderr = process.communicate(input=diskpart_script, timeout=1800)  # 30 min timeout
-
-                if process.returncode == 0:
-                    # Check new size
-                    try:
-                        new_size = os.path.getsize(path)
-                        old_size = vhdx['size']
-                        saved = old_size - new_size
-
-                        print_success(f"Compaction completed!")
-                        print(f"Size after: {format_size(new_size)}")
-                        print(f"Space saved: {format_size(saved)}")
-                    except:
-                        print_success("Compaction completed!")
-                else:
-                    print_error(f"Diskpart failed: {stderr}")
-
-            except subprocess.TimeoutExpired:
-                print_error("Diskpart timed out (file too large or disk busy)")
-            except Exception as e:
-                print_error(f"Error running diskpart: {e}")
-
-            print()
+        try:
+            process = subprocess.Popen(
+                ['diskpart'],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout, stderr = process.communicate(input=diskpart_script, timeout=1800)
+            if process.returncode == 0:
+                return True, ""
+            combined = ((stdout or "") + "\n" + (stderr or "")).strip()
+            return False, combined
+        except subprocess.TimeoutExpired:
+            return False, "Diskpart timed out (file too large or disk busy)"
+        except Exception as e:
+            return False, str(e)
 
     def compact_optimize_vhd(self):
         """Compact using Optimize-VHD cmdlet"""
@@ -621,7 +712,11 @@ exit
             print_error("Failed to get WSL distributions")
             return
 
-        distros = [d.strip() for d in output.strip().split('\n') if d.strip()]
+        distros = _parse_wsl_quiet_list(output)
+
+        if not distros:
+            print_warning("No WSL distributions found")
+            return
 
         # Shutdown WSL
         print_info("\nStep 1: Shutting down WSL...")
@@ -636,23 +731,69 @@ exit
         success_count = 0
         failed_count = 0
 
+        compacted_paths: Set[str] = set()
+        optimize_vhd_available = self._is_optimize_vhd_available()
+
+        def compact_vhdx_path(label: str, vhdx_path: str) -> bool:
+            if vhdx_path in compacted_paths:
+                return True
+            before_size = get_file_size_gb(vhdx_path)
+            if optimize_vhd_available:
+                ok, err = self._compact_vhdx_optimize_vhd(vhdx_path)
+            else:
+                ok, err = self._compact_vhdx_diskpart(vhdx_path)
+            if ok:
+                compacted_paths.add(vhdx_path)
+                after_size = get_file_size_gb(vhdx_path)
+                saved = max(0.0, before_size - after_size)
+                print_success(f"{label} compacted ({saved:.2f} GB saved)")
+                return True
+            if err:
+                print_error(f"Failed to compact {label}: {err}")
+            else:
+                print_error(f"Failed to compact {label}")
+            return False
+
         for distro in distros:
             print(f"{Colors.CYAN}Compacting: {distro}{Colors.ENDC}")
 
+            distro_arg = _ps_escape_double_quotes(distro)
+
             code, output = run_powershell(
-                f"wsl --manage {distro} --set-sparse true",
+                f"wsl --manage \"{distro_arg}\" --set-sparse true",
                 capture=True
             )
 
             if code == 0:
-                print_success(f"  ✓ {distro} compacted successfully")
+                print_success(f"{distro} compacted successfully")
                 success_count += 1
             else:
-                if "parameter is incorrect" in output.lower():
-                    print_warning(f"  ⚠ Modern method not supported for {distro}")
-                    print_info(f"    Use Diskpart method (Option 5) for {distro}")
+                output_str = (output or "").strip()
+                if _is_wsl_manage_unsupported(output_str):
+                    print_warning(f"Modern method not supported for {distro}")
                 else:
-                    print_error(f"  ✗ Failed to compact {distro}")
+                    if output_str:
+                        print_warning(f"Modern method failed for {distro}: {output_str}")
+                    else:
+                        print_warning(f"Modern method failed for {distro} (exit code {code})")
+
+                vhdx_path = _try_get_wsl_vhdx_path_from_registry(distro)
+                if not vhdx_path:
+                    print_error(f"Could not locate VHDX for {distro}")
+                    failed_count += 1
+                    continue
+
+                if compact_vhdx_path(distro, vhdx_path):
+                    success_count += 1
+                else:
+                    failed_count += 1
+
+        docker_vhdx = _try_get_docker_desktop_vhdx_path()
+        if docker_vhdx:
+            print(f"\n{Colors.BOLD}Step 3: Compacting Docker Desktop disk...{Colors.ENDC}\n")
+            if compact_vhdx_path("Docker Desktop", docker_vhdx):
+                success_count += 1
+            else:
                 failed_count += 1
 
         print(f"\n{Colors.BOLD}Compaction Summary:{Colors.ENDC}")
