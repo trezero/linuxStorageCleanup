@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Set
 import platform
+import unicodedata
+import re
 
 # ANSI color codes
 class Colors:
@@ -50,14 +52,50 @@ def print_info(text: str):
 def _ps_escape_double_quotes(value: str) -> str:
     return value.replace('`', '``').replace('"', '`"')
 
+def _strip_control_characters(value: str) -> str:
+    return "".join(ch for ch in value if not unicodedata.category(ch).startswith('C'))
+
 def _parse_wsl_quiet_list(output: str) -> List[str]:
     distros: List[str] = []
     for raw in output.splitlines():
-        cleaned = raw.replace('\x00', '').strip().lstrip('\ufeff')
-        if cleaned:
+        cleaned = raw.replace('\x00', '').lstrip('\ufeff')
+        cleaned = _strip_control_characters(cleaned).strip()
+        if cleaned and cleaned.lower() != 'name':
             distros.append(cleaned)
 
     # De-duplicate while preserving order
+    seen = set()
+    unique: List[str] = []
+    for d in distros:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+    return unique
+
+def _parse_wsl_table_list(output: str) -> List[str]:
+    distros: List[str] = []
+    for raw in (output or "").splitlines():
+        cleaned = _strip_control_characters(raw.replace('\x00', '')).strip().lstrip('\ufeff')
+        if not cleaned:
+            continue
+        lower = cleaned.lower()
+        if "no running distributions" in lower:
+            continue
+        if lower.startswith('windows subsystem for linux'):
+            continue
+        if lower.startswith('name'):
+            continue
+
+        row = cleaned
+        if row.startswith('*'):
+            row = row[1:].strip()
+        columns = [c.strip() for c in re.split(r"\s{2,}", row) if c.strip()]
+        if not columns:
+            continue
+        name = columns[0].strip()
+        if name:
+            distros.append(name)
+
     seen = set()
     unique: List[str] = []
     for d in distros:
@@ -109,7 +147,42 @@ def _try_get_docker_desktop_vhdx_path() -> Optional[str]:
         return candidate
     return None
 
-def run_powershell(command: str, capture: bool = True, check: bool = False) -> Tuple[int, str]:
+def _try_get_docker_desktop_distro_vhdx_path() -> Optional[str]:
+    localappdata = os.environ.get('LOCALAPPDATA', '')
+    if not localappdata:
+        return None
+    candidate = os.path.join(localappdata, 'Docker', 'wsl', 'distro', 'ext4.vhdx')
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+def _try_find_docker_desktop_vhdx_paths() -> List[str]:
+    localappdata = os.environ.get('LOCALAPPDATA', '')
+    if not localappdata:
+        return []
+    root = os.path.join(localappdata, 'Docker', 'wsl')
+    if not os.path.exists(root):
+        return []
+    found: List[str] = []
+    try:
+        for dirpath, _, filenames in os.walk(root):
+            for name in filenames:
+                if name.lower() == 'ext4.vhdx':
+                    path = os.path.join(dirpath, name)
+                    if os.path.exists(path):
+                        found.append(path)
+    except Exception:
+        return []
+
+    seen: Set[str] = set()
+    unique: List[str] = []
+    for p in found:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+def run_powershell(command: str, capture: bool = True, check: bool = False, timeout_seconds: Optional[int] = None) -> Tuple[int, str]:
     """
     Run a PowerShell command and return exit code and output
     """
@@ -122,13 +195,16 @@ def run_powershell(command: str, capture: bool = True, check: bool = False) -> T
                 capture_output=True,
                 text=True,
                 check=check,
+                timeout=timeout_seconds,
                 encoding='utf-8',
                 errors='replace'
             )
             return result.returncode, result.stdout + result.stderr
         else:
-            result = subprocess.run(ps_command, check=check)
+            result = subprocess.run(ps_command, check=check, timeout=timeout_seconds)
             return result.returncode, ""
+    except subprocess.TimeoutExpired as e:
+        return 124, f"Command timed out after {timeout_seconds}s: {command}"
     except subprocess.CalledProcessError as e:
         return e.returncode, str(e)
     except Exception as e:
@@ -440,7 +516,8 @@ class WindowsStorageManager:
 
             code, output = run_powershell(
                 f"wsl --manage \"{distro_arg}\" --set-sparse true",
-                capture=True
+                capture=True,
+                timeout_seconds=60,
             )
 
             if code == 0:
@@ -567,23 +644,56 @@ compact vdisk
 detach vdisk
 exit
 """
-        try:
-            process = subprocess.Popen(
-                ['diskpart'],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            stdout, stderr = process.communicate(input=diskpart_script, timeout=1800)
-            if process.returncode == 0:
-                return True, ""
-            combined = ((stdout or "") + "\n" + (stderr or "")).strip()
-            return False, combined
-        except subprocess.TimeoutExpired:
-            return False, "Diskpart timed out (file too large or disk busy)"
-        except Exception as e:
-            return False, str(e)
+        last_err = ""
+        for attempt in range(1, 4):
+            try:
+                process = subprocess.Popen(
+                    ['diskpart'],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    errors='replace',
+                )
+                stdout, stderr = process.communicate(input=diskpart_script, timeout=1800)
+                combined = ((stdout or "") + "\n" + (stderr or "")).strip()
+                if process.returncode == 0:
+                    return True, ""
+
+                last_err = combined
+                combined_lower = combined.lower()
+                if (
+                    "cannot access the file" in combined_lower
+                    or "being used by another process" in combined_lower
+                    or "the process cannot access the file" in combined_lower
+                ) and attempt < 3:
+                    time.sleep(10)
+                    continue
+                return False, combined
+            except subprocess.TimeoutExpired:
+                last_err = "Diskpart timed out (file too large or disk busy)"
+                return False, last_err
+            except Exception as e:
+                last_err = str(e)
+                return False, last_err
+        return False, last_err
+
+    def _wait_for_wsl_shutdown_complete(self, timeout_seconds: int = 60) -> bool:
+        deadline = time.time() + max(1, timeout_seconds)
+        while time.time() < deadline:
+            code, output = run_powershell("wsl --list --running", capture=True)
+            if code != 0:
+                return False
+            running = _parse_wsl_table_list(output)
+            if not running:
+                return True
+            time.sleep(2)
+        code, output = run_powershell("wsl --list --running", capture=True)
+        if code == 0:
+            running = _parse_wsl_table_list(output)
+            if running:
+                print_warning(f"Still running: {', '.join(running)}")
+        return False
 
     def compact_optimize_vhd(self):
         """Compact using Optimize-VHD cmdlet"""
@@ -713,6 +823,12 @@ exit
             return
 
         distros = _parse_wsl_quiet_list(output)
+        if not distros:
+            code2, output2 = run_powershell("wsl --list --verbose", capture=True)
+            if code2 == 0:
+                distros = _parse_wsl_table_list(output2)
+
+        distros = [d for d in distros if d and d.strip()]
 
         if not distros:
             print_warning("No WSL distributions found")
@@ -721,8 +837,9 @@ exit
         # Shutdown WSL
         print_info("\nStep 1: Shutting down WSL...")
         run_powershell("wsl --shutdown", capture=True)
-        print_info("Waiting 10 seconds for complete shutdown...")
-        time.sleep(10)
+        print_info("Waiting for complete shutdown...")
+        if not self._wait_for_wsl_shutdown_complete(timeout_seconds=60):
+            print_warning("WSL still appears to be running; compaction may fail if VHDX files are locked")
         print_success("WSL shutdown complete")
 
         # Compact distributions
@@ -733,13 +850,24 @@ exit
 
         compacted_paths: Set[str] = set()
         optimize_vhd_available = self._is_optimize_vhd_available()
+        allow_unsafe_sparse: Optional[bool] = None
+        docker_vhdx_candidates = _try_find_docker_desktop_vhdx_paths()
 
         def compact_vhdx_path(label: str, vhdx_path: str) -> bool:
+            nonlocal optimize_vhd_available
             if vhdx_path in compacted_paths:
                 return True
             before_size = get_file_size_gb(vhdx_path)
             if optimize_vhd_available:
                 ok, err = self._compact_vhdx_optimize_vhd(vhdx_path)
+                err_lower = (err or "").lower()
+                if (not ok) and (
+                    "hyper-v management tools could not access" in err_lower
+                    or "hyper-v platform is not installed" in err_lower
+                    or "wmi" in err_lower and "hyper-v" in err_lower
+                ):
+                    optimize_vhd_available = False
+                    ok, err = self._compact_vhdx_diskpart(vhdx_path)
             else:
                 ok, err = self._compact_vhdx_diskpart(vhdx_path)
             if ok:
@@ -755,6 +883,10 @@ exit
             return False
 
         for distro in distros:
+            distro = (distro or "").strip()
+            if not distro:
+                continue
+
             print(f"{Colors.CYAN}Compacting: {distro}{Colors.ENDC}")
 
             distro_arg = _ps_escape_double_quotes(distro)
@@ -769,6 +901,29 @@ exit
                 success_count += 1
             else:
                 output_str = (output or "").strip()
+                output_lower = output_str.lower()
+
+                if (
+                    "sparse vhd support is currently disabled" in output_lower
+                    or "--allow-unsafe" in output_lower
+                    or "wsl/service/e_invalidarg" in output_lower
+                ):
+                    if allow_unsafe_sparse is None:
+                        print_warning("WSL refused sparse VHD mode because it is marked unsafe on this version")
+                        sys.stdout.flush()
+                        allow_unsafe_sparse = input("Retry sparse VHD enablement with --allow-unsafe for all distros? (y/n): ").strip().lower() == 'y'
+                    if allow_unsafe_sparse:
+                        code2, output2 = run_powershell(
+                            f"wsl --manage \"{distro_arg}\" --set-sparse true --allow-unsafe",
+                            capture=True,
+                            timeout_seconds=60,
+                        )
+                        if code2 == 0:
+                            print_success(f"{distro} compacted successfully")
+                            success_count += 1
+                            continue
+                        output_str = (output2 or "").strip() or output_str
+
                 if _is_wsl_manage_unsupported(output_str):
                     print_warning(f"Modern method not supported for {distro}")
                 else:
@@ -778,6 +933,24 @@ exit
                         print_warning(f"Modern method failed for {distro} (exit code {code})")
 
                 vhdx_path = _try_get_wsl_vhdx_path_from_registry(distro)
+                if not vhdx_path and distro.lower() == "docker-desktop":
+                    vhdx_path = _try_get_docker_desktop_distro_vhdx_path()
+                if not vhdx_path and distro.lower() == "docker-desktop" and docker_vhdx_candidates:
+                    preferred = None
+                    for p in docker_vhdx_candidates:
+                        if "\\distro\\" in p.lower():
+                            preferred = p
+                            break
+                    vhdx_path = preferred or docker_vhdx_candidates[0]
+                if not vhdx_path and distro.lower() == "docker-desktop-data":
+                    vhdx_path = _try_get_docker_desktop_vhdx_path()
+                if not vhdx_path and distro.lower() == "docker-desktop-data" and docker_vhdx_candidates:
+                    preferred = None
+                    for p in docker_vhdx_candidates:
+                        if "\\data\\" in p.lower():
+                            preferred = p
+                            break
+                    vhdx_path = preferred or docker_vhdx_candidates[0]
                 if not vhdx_path:
                     print_error(f"Could not locate VHDX for {distro}")
                     failed_count += 1
@@ -788,13 +961,41 @@ exit
                 else:
                     failed_count += 1
 
-        docker_vhdx = _try_get_docker_desktop_vhdx_path()
-        if docker_vhdx:
+        docker_data_vhdx = _try_get_docker_desktop_vhdx_path()
+        docker_distro_vhdx = _try_get_docker_desktop_distro_vhdx_path()
+        if (not docker_data_vhdx) and docker_vhdx_candidates:
+            for p in docker_vhdx_candidates:
+                if "\\data\\" in p.lower():
+                    docker_data_vhdx = p
+                    break
+        if (not docker_distro_vhdx) and docker_vhdx_candidates:
+            for p in docker_vhdx_candidates:
+                if "\\distro\\" in p.lower():
+                    docker_distro_vhdx = p
+                    break
+
+        extra_docker_vhdx: List[str] = []
+        for p in docker_vhdx_candidates:
+            if p != docker_data_vhdx and p != docker_distro_vhdx:
+                extra_docker_vhdx.append(p)
+
+        if docker_data_vhdx or docker_distro_vhdx or extra_docker_vhdx:
             print(f"\n{Colors.BOLD}Step 3: Compacting Docker Desktop disk...{Colors.ENDC}\n")
-            if compact_vhdx_path("Docker Desktop", docker_vhdx):
-                success_count += 1
-            else:
-                failed_count += 1
+            if docker_data_vhdx:
+                if compact_vhdx_path("Docker Desktop", docker_data_vhdx):
+                    success_count += 1
+                else:
+                    failed_count += 1
+            if docker_distro_vhdx:
+                if compact_vhdx_path("Docker Desktop", docker_distro_vhdx):
+                    success_count += 1
+                else:
+                    failed_count += 1
+            for p in extra_docker_vhdx:
+                if compact_vhdx_path("Docker Desktop", p):
+                    success_count += 1
+                else:
+                    failed_count += 1
 
         print(f"\n{Colors.BOLD}Compaction Summary:{Colors.ENDC}")
         print(f"  Successfully compacted: {success_count}")
